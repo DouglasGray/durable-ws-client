@@ -1,0 +1,17 @@
+[package]
+name = "durable-ws-client"
+version = "0.1.0"
+authors = ["Douglas Gray <dbgray01@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1.5", features = ["rt", "net", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.14", features = ["rustls-tls"] }
+url = "2.2"
+
+[dev-dependencies]
+async-channel = "1.6"
+tokio-stream = "0.1"
+tokio-util = "0.6"
