@@ -13,15 +13,28 @@ use url::Url;
 
 use crate::{backoff::BackoffGenerator, websocket::Builder as WebSocketBuilder};
 
-type Responder<E> = oneshot::Sender<Result<(), E>>;
+type AckTx<E> = oneshot::Sender<Result<(), E>>;
+type AckRx<E> = oneshot::Receiver<Result<(), E>>;
 
 /// Messages which may be sent down the websocket.
 ///
-/// The result of the send will be returned via `Responder`.
+/// The result of the send will be returned via `Ack`.
 #[derive(Debug)]
 pub enum MsgToSend {
-    Text(String, Responder<WsError>),
-    Binary(Vec<u8>, Responder<WsError>),
+    Text(String, AckTx<WsError>),
+    Binary(Vec<u8>, AckTx<WsError>),
+}
+
+impl MsgToSend {
+    pub fn text(s: String) -> (Self, AckRx<WsError>) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        (Self::Text(s, ack_tx), ack_rx)
+    }
+
+    pub fn binary(b: Vec<u8>) -> (Self, AckRx<WsError>) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        (Self::Binary(b, ack_tx), ack_rx)
+    }
 }
 
 /// Messages which may be received from the websocket.
@@ -80,6 +93,17 @@ pub struct Config {
     pub channel_size: usize,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ws_config: Some(WsConfig::default()),
+            connect_timeout: Duration::from_secs(10),
+            close_timeout: Duration::from_secs(10),
+            channel_size: 1024,
+        }
+    }
+}
+
 /// A reconnecting websocket client. This will continually try to
 /// restore a websocket connection to the provided `url` if it
 /// closes.
@@ -98,7 +122,7 @@ impl Client {
         backoff_generator: B,
     ) -> mpsc::Receiver<Event>
     where
-        W: 'static + WebSocketBuilder + Send + Clone,
+        W: 'static + WebSocketBuilder + Send,
         B: 'static + BackoffGenerator + Send,
         W::Sender: Send + Unpin,
         W::Receiver: Send + Unpin,
@@ -120,7 +144,7 @@ async fn run<W, B>(
     mut backoff_generator: B,
     listener: mpsc::Sender<Event>,
 ) where
-    W: 'static + WebSocketBuilder + Send + Clone,
+    W: 'static + WebSocketBuilder + Send,
     B: 'static + BackoffGenerator + Send,
     W::Sender: Send + Unpin,
     W::Receiver: Send + Unpin,
@@ -132,7 +156,6 @@ async fn run<W, B>(
             return;
         }
 
-        // Try connect
         let res = connect(
             config.ws_config.clone(),
             &url,
@@ -150,7 +173,8 @@ async fn run<W, B>(
                 let (app_to_client_tx, app_to_client_rx) = mpsc::channel(config.channel_size);
                 let (client_to_app_tx, client_to_app_rx) = mpsc::channel(config.channel_size);
 
-                // Connection has been successful, let the application know
+                // Connection has been successful, pass the channels
+                // to the application
                 if let Err(_) = listener
                     .send(Connected(app_to_client_tx, client_to_app_rx))
                     .await
@@ -167,20 +191,17 @@ async fn run<W, B>(
                 )
                 .await;
 
-                // Inform the application that the connection has closed
                 if let Err(_) = listener.send(ConnectionClosed).await {
                     return;
                 }
             }
             Err(e) => {
-                // Let the application know the connection attempt failed
                 if let Err(_) = listener.send(FailedToConnect(e)).await {
                     return;
                 }
             }
         }
 
-        // Wait some time before trying again
         let wait_for = backoff_generator.next_delay();
 
         time::sleep(wait_for).await;
@@ -322,21 +343,7 @@ async fn write_to_socket<S>(
     }
 }
 
-fn process_recvd_msg(ws_msg: WsMessage) -> Option<MsgRecvd> {
-    match ws_msg {
-        WsMessage::Text(s) => Some(MsgRecvd::Text(s)),
-        WsMessage::Binary(b) => Some(MsgRecvd::Binary(b)),
-        WsMessage::Close(f) => Some(MsgRecvd::Close(f)),
-        WsMessage::Ping(_) | WsMessage::Pong(_) => None,
-    }
-}
-
-async fn close_and_drain_receiver<T>(mut rx: mpsc::Receiver<T>) {
-    rx.close();
-
-    while let Some(_) = rx.recv().await {}
-}
-
+/// Handle the websocket close sequence.
 async fn close_websocket<Si, St>(mut ws_tx: Si, mut ws_rx: St, close_timeout: Duration)
 where
     Si: Sink<WsMessage, Error = WsError> + Unpin,
@@ -353,36 +360,227 @@ where
     let _ = time::timeout(close_timeout, drain_fut).await;
 }
 
+fn process_recvd_msg(ws_msg: WsMessage) -> Option<MsgRecvd> {
+    match ws_msg {
+        WsMessage::Text(s) => Some(MsgRecvd::Text(s)),
+        WsMessage::Binary(b) => Some(MsgRecvd::Binary(b)),
+        WsMessage::Close(f) => Some(MsgRecvd::Close(f)),
+        WsMessage::Ping(_) | WsMessage::Pong(_) => None,
+    }
+}
+
+async fn close_and_drain_receiver<T>(mut rx: mpsc::Receiver<T>) {
+    rx.close();
+
+    while let Some(_) = rx.recv().await {}
+}
+
 #[cfg(test)]
 mod tests {
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, handshake::client::Response};
+
     use super::*;
 
-    #[test]
-    fn receiving_a_message_should_work() {
-        todo!()
+    use crate::backoff::FixedBackoff;
+
+    #[tokio::test]
+    async fn should_reconnect_on_connection_failure() {
+        let (sink, _sink_rx) = utils::create_ws_sink();
+        let (_stream_tx, stream) = utils::create_ws_stream();
+
+        let (connect_res_tx, connect_res_rx) = async_channel::unbounded();
+
+        let builder = utils::TestBuilder::new(connect_res_rx);
+        let backoff = FixedBackoff::new(Duration::from_millis(10));
+
+        connect_res_tx
+            .send(Err(WsError::Protocol(ProtocolError::WrongHttpMethod)))
+            .await
+            .unwrap();
+
+        connect_res_tx
+            .send(Ok((sink, stream, Response::default())))
+            .await
+            .unwrap();
+
+        let mut event_rx = Client::connect(
+            Config::default(),
+            "wss://test.com".parse().unwrap(),
+            builder,
+            backoff,
+        )
+        .await;
+
+        // First connection attempt fails
+        match event_rx.recv().await.unwrap() {
+            Event::AttemptingNewConnection => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        match event_rx.recv().await.unwrap() {
+            Event::FailedToConnect(_) => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        // Second attempt succeeds
+        match event_rx.recv().await.unwrap() {
+            Event::AttemptingNewConnection => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        match event_rx.recv().await.unwrap() {
+            Event::Connected(_, _) => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
     }
 
-    #[test]
-    fn sending_a_message_should_work() {
-        todo!()
+    #[tokio::test]
+    async fn should_reconnect_on_connection_close() {
+        let (sink, sink_rx) = utils::create_ws_sink();
+        let (stream_tx, stream) = utils::create_ws_stream();
+
+        let (connect_res_tx, connect_res_rx) = async_channel::unbounded();
+
+        let builder = utils::TestBuilder::new(connect_res_rx);
+        let backoff = FixedBackoff::new(Duration::from_millis(10));
+
+        connect_res_tx
+            .send(Ok((sink, stream, Response::default())))
+            .await
+            .unwrap();
+
+        let mut event_rx = Client::connect(
+            Config::default(),
+            "wss://test.com".parse().unwrap(),
+            builder,
+            backoff,
+        )
+        .await;
+
+        // Connect and succeed
+        match event_rx.recv().await.unwrap() {
+            Event::AttemptingNewConnection => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        let (msg_tx, _msg_rx) = match event_rx.recv().await.unwrap() {
+            Event::Connected(tx, rx) => (tx, rx),
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        // Drop to simulate the connection closing
+        drop(stream_tx);
+        sink_rx.close();
+
+        // Try send a message down the connection and discover it's
+        // closed
+        let (msg, _ack_rx) = MsgToSend::text("Hello".into());
+
+        msg_tx.send(msg).await.unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            Event::ConnectionClosed => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        // A fresh 'connection'
+        let (sink, _sink_rx) = utils::create_ws_sink();
+        let (_stream_tx, stream) = utils::create_ws_stream();
+
+        connect_res_tx
+            .send(Ok((sink, stream, Response::default())))
+            .await
+            .unwrap();
+
+        match event_rx.recv().await.unwrap() {
+            Event::AttemptingNewConnection => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        match event_rx.recv().await.unwrap() {
+            Event::Connected(_, _) => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+    }
+
+    #[tokio::test]
+    async fn send_and_receive_should_work() {
+        let (sink, sink_rx) = utils::create_ws_sink();
+        let (stream_tx, stream) = utils::create_ws_stream();
+
+        let (connect_res_tx, connect_res_rx) = async_channel::unbounded();
+
+        let builder = utils::TestBuilder::new(connect_res_rx);
+        let backoff = FixedBackoff::new(Duration::from_millis(10));
+
+        connect_res_tx
+            .send(Ok((sink, stream, Response::default())))
+            .await
+            .unwrap();
+
+        let mut event_rx = Client::connect(
+            Config::default(),
+            "wss://test.com".parse().unwrap(),
+            builder,
+            backoff,
+        )
+        .await;
+
+        match event_rx.recv().await.unwrap() {
+            Event::AttemptingNewConnection => {}
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        let (app_to_ws_tx, mut ws_to_app_rx) = match event_rx.recv().await.unwrap() {
+            Event::Connected(tx, rx) => (tx, rx),
+            other => panic!("unexpected event: {:?}", other),
+        };
+
+        // Send a message from the application and confirm it's received
+        let (app_msg, ack_rx) = MsgToSend::text("Hello".into());
+
+        app_to_ws_tx.send(app_msg).await.unwrap();
+
+        assert!(ack_rx.await.is_ok());
+
+        assert_eq!(sink_rx.recv().await.unwrap(), "Hello".into());
+
+        // Send a message from the peer and confirm it's received
+        stream_tx
+            .send(Ok(WsMessage::Text("World".into())))
+            .await
+            .unwrap();
+
+        let ws_msg = ws_to_app_rx.recv().await.unwrap().unwrap();
+
+        match ws_msg {
+            MsgRecvd::Text(s) => {
+                assert_eq!(s, "World")
+            }
+            _ => panic!("unexpected message"),
+        }
     }
 
     mod utils {
-        use async_channel::{
-            Receiver as UnboundedReceiver, Sender as UnboundedSender, TryRecvError,
-        };
-        use futures::{Sink, Stream};
+        use async_channel::{Receiver as UnboundedReceiver, Sender as UnboundedSender};
+        use async_trait::async_trait;
+        use futures::Sink;
         use std::{
             pin::Pin,
             task::{Context, Poll},
         };
-        use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
+        use tokio_tungstenite::tungstenite::{
+            handshake::client::Response, protocol::WebSocketConfig, Error as WsError,
+            Message as WsMessage,
+        };
+
+        use crate::websocket::Builder;
 
         // Create a websocket stream, plus sender to submit messages
         // into the stream
-        fn create_ws_stream() -> (
+        pub fn create_ws_stream() -> (
             UnboundedSender<Result<WsMessage, WsError>>,
-            impl Stream<Item = Result<WsMessage, WsError>>,
+            UnboundedReceiver<Result<WsMessage, WsError>>,
         ) {
             async_channel::unbounded()
         }
@@ -390,25 +588,50 @@ mod tests {
         // Create a websocket sink, along with a sender to submit
         // errors to and a receiver to read the messages that have
         // been submitted to the sink
-        fn create_ws_sink() -> (
-            UnboundedSender<WsError>,
-            UnboundedReceiver<WsMessage>,
-            impl Sink<WsMessage, Error = WsError>,
-        ) {
-            let (err_tx, err_rx) = async_channel::unbounded();
-            let (ws_tx, ws_rx) = async_channel::unbounded();
+        pub fn create_ws_sink() -> (TestSink, UnboundedReceiver<WsMessage>) {
+            let (tx, rx) = async_channel::unbounded();
 
-            let sink = TestSink {
-                sink: ws_tx,
-                errs: err_rx,
-            };
+            let sink = TestSink { sink: tx };
 
-            (err_tx, ws_rx, sink)
+            (sink, rx)
         }
 
-        struct TestSink {
+        type ConnectResult = Result<
+            (
+                TestSink,
+                UnboundedReceiver<Result<WsMessage, WsError>>,
+                Response,
+            ),
+            WsError,
+        >;
+
+        pub struct TestBuilder {
+            rx: UnboundedReceiver<ConnectResult>,
+        }
+
+        impl TestBuilder {
+            pub fn new(rx: UnboundedReceiver<ConnectResult>) -> Self {
+                Self { rx }
+            }
+        }
+
+        #[async_trait]
+        impl Builder for TestBuilder {
+            type Sender = TestSink;
+
+            type Receiver = UnboundedReceiver<Result<WsMessage, WsError>>;
+
+            async fn connect(
+                &mut self,
+                _config: Option<WebSocketConfig>,
+                _url: &url::Url,
+            ) -> Result<(Self::Sender, Self::Receiver, Response), WsError> {
+                self.rx.recv().await.unwrap()
+            }
+        }
+
+        pub struct TestSink {
             sink: UnboundedSender<WsMessage>,
-            errs: UnboundedReceiver<WsError>,
         }
 
         impl Sink<WsMessage> for TestSink {
@@ -422,12 +645,6 @@ mod tests {
             }
 
             fn start_send(self: Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
-                match self.errs.try_recv() {
-                    Ok(e) => return Err(e),
-                    Err(TryRecvError::Closed) => return Err(WsError::ConnectionClosed),
-                    Err(TryRecvError::Empty) => {}
-                }
-
                 if let Err(_) = self.sink.try_send(item) {
                     return Err(WsError::ConnectionClosed);
                 }
