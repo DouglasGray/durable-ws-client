@@ -13,25 +13,23 @@ use url::Url;
 
 use crate::{backoff::BackoffGenerator, websocket::Builder as WebSocketBuilder};
 
-type AckTx<E> = oneshot::Sender<Result<(), E>>;
-type AckRx<E> = oneshot::Receiver<Result<(), E>>;
+type AckSender<E> = oneshot::Sender<Result<(), E>>;
+type AckReceiver<E> = oneshot::Receiver<Result<(), E>>;
 
 /// Messages which may be sent down the websocket.
-///
-/// The result of the send will be returned via `Ack`.
 #[derive(Debug)]
 pub enum MsgToSend {
-    Text(String, AckTx<WsError>),
-    Binary(Vec<u8>, AckTx<WsError>),
+    Text(String, AckSender<WsError>),
+    Binary(Vec<u8>, AckSender<WsError>),
 }
 
 impl MsgToSend {
-    pub fn text(s: String) -> (Self, AckRx<WsError>) {
+    pub fn text(s: String) -> (Self, AckReceiver<WsError>) {
         let (ack_tx, ack_rx) = oneshot::channel();
         (Self::Text(s, ack_tx), ack_rx)
     }
 
-    pub fn binary(b: Vec<u8>) -> (Self, AckRx<WsError>) {
+    pub fn binary(b: Vec<u8>) -> (Self, AckReceiver<WsError>) {
         let (ack_tx, ack_rx) = oneshot::channel();
         (Self::Binary(b, ack_tx), ack_rx)
     }
