@@ -1,3 +1,4 @@
 pub mod backoff;
 pub mod client;
-pub mod websocket;
+pub mod config;
+pub mod connection;

@@ -1,17 +1,18 @@
 [package]
 name = "durable-ws-client"
-version = "0.1.1"
+version = "1.0.0"
 authors = ["Douglas Gray <dbgray01@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-async-trait = "0.1"
-futures = "0.3"
-tokio = { version = "1.5", features = ["rt", "net", "sync", "time", "macros"] }
-tokio-tungstenite = { version = "0.14", features = ["rustls-tls"] }
-url = "2.2"
+async-trait = "0.1.56"
+futures = "0.3.21"
+tokio = { version = "1.19.2", features = ["net", "sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.17.1", features = ["native-tls"] }
+url = "2.2.2"
 
 [dev-dependencies]
 async-channel = "1.6"
 tokio-stream = "0.1"
 tokio-util = "0.6"
+tokio = { version = "*", features = ["rt-multi-thread"] }

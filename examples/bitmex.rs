@@ -1,18 +1,3 @@
-# durable-ws-client
-
-A reconnecting websocket client written in Rust.
-
-The client (located in `src/client.rs`) will attempt to reconnect on
-any error, while informing the application of the error so it can
-permanently terminate the connection if desired.
-
-### Example usage
-
-Requires an entry along the lines of `tokio = { version = "1.19.2",
-features = ["rt-multi-thread", "macros", "sync"] }` in your
-`Cargo.toml` to work.
-
-```
 use durable_ws_client::{
     backoff::FixedBackoff,
     client::{NewConnection, ReconnectingClient},
@@ -58,4 +43,3 @@ async fn main() {
 
     join!(client_task, reader_task);
 }
-```
