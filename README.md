@@ -8,9 +8,10 @@ permanently terminate the connection if desired.
 
 ### Example usage
 
-Requires an entry along the lines of `tokio = { version = "1.19.2",
+Requires an entry along the lines of `tokio = { version = "1.21.2",
 features = ["rt-multi-thread", "macros", "sync"] }` in your
-`Cargo.toml` to work.
+`Cargo.toml` to work, along with some kind of TLS feature enabled on
+this library, for example `"native-tls"`.
 
 ```
 use durable_ws_client::{
