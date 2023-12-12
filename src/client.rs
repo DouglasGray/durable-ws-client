@@ -37,20 +37,18 @@ pub enum ConnectError {
 
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use ConnectError::*;
         match self {
-            Inner(e) => fmt::Display::fmt(e, f),
-            TimedOut => write!(f, "connection attempt timed out"),
+            Self::Inner(e) => fmt::Display::fmt(e, f),
+            Self::TimedOut => write!(f, "connection attempt timed out"),
         }
     }
 }
 
 impl StdError for ConnectError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        if let ConnectError::Inner(e) = self {
-            Some(e)
-        } else {
-            None
+        match self {
+            Self::Inner(e) => Some(e),
+            Self::TimedOut => None,
         }
     }
 }
@@ -311,11 +309,9 @@ async fn write_to_socket<S>(
            msg_to_send = app_rx.recv() => match msg_to_send {
                None => break,
                Some(msg_to_send) => {
-                   use tungstenite::Message::*;
-
                    let ws_msg = match msg_to_send {
-                       Message::Text(s) => Text(s),
-                       Message::Binary(b) => Binary(b)
+                       Message::Text(s) => tungstenite::Message::Text(s),
+                       Message::Binary(b) => tungstenite::Message::Binary(b)
                    };
 
                    if let Err(e) = socket.send(ws_msg).await {
@@ -338,11 +334,9 @@ where
     Si: Sink<tungstenite::Message, Error = Error> + Unpin,
     St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
 {
-    use tungstenite::Message::*;
-
     // TODO: determine the proper close frame we need to send from
     // seen errors, if any.
-    let close_websocket = ws_tx.send(Close(None));
+    let close_websocket = ws_tx.send(tungstenite::Message::Close(None));
 
     let drain_receiver = async { while let Some(_) = ws_rx.next().await {} };
 
