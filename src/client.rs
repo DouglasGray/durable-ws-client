@@ -8,11 +8,7 @@ use tokio::{
     },
     time,
 };
-use tokio_tungstenite::tungstenite::{
-    self,
-    protocol::{CloseFrame, WebSocketConfig},
-    Error,
-};
+use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Error};
 use url::Url;
 
 use crate::{backoff::BackoffGenerator, config::Config, connection::Connector};
@@ -37,20 +33,18 @@ pub enum ConnectError {
 
 impl fmt::Display for ConnectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use ConnectError::*;
         match self {
-            Inner(e) => fmt::Display::fmt(e, f),
-            TimedOut => write!(f, "connection attempt timed out"),
+            Self::Inner(e) => fmt::Display::fmt(e, f),
+            Self::TimedOut => write!(f, "connection attempt timed out"),
         }
     }
 }
 
 impl StdError for ConnectError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        if let ConnectError::Inner(e) = self {
-            Some(e)
-        } else {
-            None
+        match self {
+            Self::Inner(e) => Some(e),
+            Self::TimedOut => None,
         }
     }
 }
@@ -101,13 +95,7 @@ async fn run<C, B>(
     C::Receiver: Send + Unpin,
 {
     loop {
-        let res = connect(
-            config.ws_config(),
-            &url,
-            config.connect_timeout(),
-            &mut connection_builder,
-        )
-        .await;
+        let res = connect(config, &url, &mut connection_builder).await;
 
         match res {
             Ok(s) => {
@@ -157,17 +145,16 @@ async fn run<C, B>(
 
 /// Try open a connection to `url`.
 async fn connect<C>(
-    config: Option<WebSocketConfig>,
+    config: Config,
     url: &Url,
-    timeout: Duration,
     connection_builder: &mut C,
 ) -> Result<(C::Sender, C::Receiver), ConnectError>
 where
     C: Connector,
 {
-    let connection = connection_builder.connect(config, &url);
+    let connection = connection_builder.connect(config.ws_config(), &url, config.disable_nagle());
 
-    if let Ok(res) = time::timeout(timeout, connection).await {
+    if let Ok(res) = time::timeout(config.connect_timeout(), connection).await {
         res.map(|(tx, rx, _)| (tx, rx)).map_err(Into::into)
     } else {
         Err(ConnectError::TimedOut)
@@ -263,13 +250,11 @@ async fn read_from_socket<S>(
                 None => break,
                 Some(ws_msg) => match ws_msg {
                     Ok(ws_msg) => {
-                        use tungstenite::Message::*;
-
                         let msg = match ws_msg {
-                            Text(s) => Message::Text(s),
-                            Binary(b) => Message::Binary(b),
-                            Ping(_) | Pong(_) | Frame(_) => continue,
-                            Close(frame) => {
+                            tungstenite::Message::Text(s) => Message::Text(s),
+                            tungstenite::Message::Binary(b) => Message::Binary(b),
+                            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) | tungstenite::Message::Frame(_) => continue,
+                            tungstenite::Message::Close(frame) => {
                                 if let Some(f) = frame {
                                     close_frame_tx.try_send(f).ok();
                                 }
@@ -298,7 +283,7 @@ async fn read_from_socket<S>(
 /// Read messages from the application via `app_rx` and send them down
 /// `socket`.
 async fn write_to_socket<S>(
-    mut shutdown: oneshot::Receiver<()>,
+    mut shutdown: OnceReceiver<()>,
     error_tx: &Sender<Error>,
     app_rx: &mut Receiver<Message>,
     socket: &mut S,
@@ -311,11 +296,9 @@ async fn write_to_socket<S>(
            msg_to_send = app_rx.recv() => match msg_to_send {
                None => break,
                Some(msg_to_send) => {
-                   use tungstenite::Message::*;
-
                    let ws_msg = match msg_to_send {
-                       Message::Text(s) => Text(s),
-                       Message::Binary(b) => Binary(b)
+                       Message::Text(s) => tungstenite::Message::Text(s),
+                       Message::Binary(b) => tungstenite::Message::Binary(b)
                    };
 
                    if let Err(e) = socket.send(ws_msg).await {
@@ -338,11 +321,9 @@ where
     Si: Sink<tungstenite::Message, Error = Error> + Unpin,
     St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
 {
-    use tungstenite::Message::*;
-
     // TODO: determine the proper close frame we need to send from
     // seen errors, if any.
-    let close_websocket = ws_tx.send(Close(None));
+    let close_websocket = ws_tx.send(tungstenite::Message::Close(None));
 
     let drain_receiver = async { while let Some(_) = ws_rx.next().await {} };
 

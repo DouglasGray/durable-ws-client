@@ -22,6 +22,7 @@ pub trait Connector {
         &mut self,
         config: Option<WebSocketConfig>,
         url: &Url,
+        disable_nagle: bool,
     ) -> Result<(Self::Sender, Self::Receiver, Response), Error>;
 }
 
@@ -38,8 +39,11 @@ impl Connector for WebSocketBuilder {
         &mut self,
         config: Option<WebSocketConfig>,
         url: &Url,
+        disable_nagle: bool,
     ) -> Result<(Self::Sender, Self::Receiver, Response), Error> {
-        let (ws, resp) = tokio_tungstenite::connect_async_with_config(url.clone(), config).await?;
+        let (ws, resp) =
+            tokio_tungstenite::connect_async_with_config(url.clone(), config, disable_nagle)
+                .await?;
         let (tx, rx) = ws.split();
         Ok((tx, rx, resp))
     }
