@@ -1,6 +1,7 @@
 # durable-ws-client
 
-A reconnecting websocket client written in Rust.
+A reconnecting websocket client written in Rust, using
+[`tokio-tungstenite`](https://github.com/snapview/tokio-tungstenite).
 
 The client (located in `src/client.rs`) will attempt to reconnect on
 any error, while informing the application of the error so it can
