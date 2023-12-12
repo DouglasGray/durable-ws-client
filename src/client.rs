@@ -8,11 +8,7 @@ use tokio::{
     },
     time,
 };
-use tokio_tungstenite::tungstenite::{
-    self,
-    protocol::{CloseFrame, WebSocketConfig},
-    Error,
-};
+use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Error};
 use url::Url;
 
 use crate::{backoff::BackoffGenerator, config::Config, connection::Connector};
@@ -99,13 +95,7 @@ async fn run<C, B>(
     C::Receiver: Send + Unpin,
 {
     loop {
-        let res = connect(
-            config.ws_config(),
-            &url,
-            config.connect_timeout(),
-            &mut connection_builder,
-        )
-        .await;
+        let res = connect(config, &url, &mut connection_builder).await;
 
         match res {
             Ok(s) => {
@@ -155,17 +145,16 @@ async fn run<C, B>(
 
 /// Try open a connection to `url`.
 async fn connect<C>(
-    config: Option<WebSocketConfig>,
+    config: Config,
     url: &Url,
-    timeout: Duration,
     connection_builder: &mut C,
 ) -> Result<(C::Sender, C::Receiver), ConnectError>
 where
     C: Connector,
 {
-    let connection = connection_builder.connect(config, &url);
+    let connection = connection_builder.connect(config.ws_config(), &url, config.disable_nagle());
 
-    if let Ok(res) = time::timeout(timeout, connection).await {
+    if let Ok(res) = time::timeout(config.connect_timeout(), connection).await {
         res.map(|(tx, rx, _)| (tx, rx)).map_err(Into::into)
     } else {
         Err(ConnectError::TimedOut)

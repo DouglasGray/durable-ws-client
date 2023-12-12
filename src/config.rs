@@ -7,6 +7,7 @@ pub struct ConfigBuilder {
     connect_timeout: Duration,
     close_timeout: Duration,
     channel_size: usize,
+    disable_nagle: bool,
 }
 
 impl ConfigBuilder {
@@ -34,12 +35,18 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn disable_nagle(&mut self, disable_nagle: bool) -> &mut Self {
+        self.disable_nagle = disable_nagle;
+        self
+    }
+
     pub fn build(&self) -> Config {
         Config {
             ws_config: self.ws_config,
             connect_timeout: self.connect_timeout,
             close_timeout: self.close_timeout,
             channel_size: self.channel_size,
+            disable_nagle: self.disable_nagle,
         }
     }
 }
@@ -51,6 +58,7 @@ impl Default for ConfigBuilder {
             connect_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(10),
             channel_size: 1024,
+            disable_nagle: false,
         }
     }
 }
@@ -62,6 +70,7 @@ pub struct Config {
     connect_timeout: Duration,
     close_timeout: Duration,
     channel_size: usize,
+    disable_nagle: bool,
 }
 
 impl Config {
@@ -80,6 +89,10 @@ impl Config {
     pub fn channel_size(&self) -> usize {
         self.channel_size
     }
+
+    pub fn disable_nagle(&self) -> bool {
+        self.disable_nagle
+    }
 }
 
 impl Default for Config {
@@ -89,6 +102,7 @@ impl Default for Config {
             connect_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(10),
             channel_size: 1024,
+            disable_nagle: false,
         }
     }
 }
