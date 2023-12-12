@@ -250,13 +250,11 @@ async fn read_from_socket<S>(
                 None => break,
                 Some(ws_msg) => match ws_msg {
                     Ok(ws_msg) => {
-                        use tungstenite::Message::*;
-
                         let msg = match ws_msg {
-                            Text(s) => Message::Text(s),
-                            Binary(b) => Message::Binary(b),
-                            Ping(_) | Pong(_) | Frame(_) => continue,
-                            Close(frame) => {
+                            tungstenite::Message::Text(s) => Message::Text(s),
+                            tungstenite::Message::Binary(b) => Message::Binary(b),
+                            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) | tungstenite::Message::Frame(_) => continue,
+                            tungstenite::Message::Close(frame) => {
                                 if let Some(f) = frame {
                                     close_frame_tx.try_send(f).ok();
                                 }
@@ -285,7 +283,7 @@ async fn read_from_socket<S>(
 /// Read messages from the application via `app_rx` and send them down
 /// `socket`.
 async fn write_to_socket<S>(
-    mut shutdown: oneshot::Receiver<()>,
+    mut shutdown: OnceReceiver<()>,
     error_tx: &Sender<Error>,
     app_rx: &mut Receiver<Message>,
     socket: &mut S,
