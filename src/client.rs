@@ -1,6 +1,7 @@
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use http::Uri;
 use std::{error::Error as StdError, fmt, time::Duration};
+use tokio::task::JoinHandle;
 use tokio::{
     join, select,
     sync::{
@@ -10,6 +11,7 @@ use tokio::{
     time,
 };
 use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Error};
+use tokio_util::sync::CancellationToken;
 use tower::retry::backoff::{Backoff, MakeBackoff};
 
 use crate::{config::Config, connection::Connector};
@@ -164,64 +166,46 @@ where
 
 async fn run_inner<Si, St>(
     close_timeout: Duration,
-    mut ws_tx: Si,
-    mut ws_rx: St,
+    ws_tx: Si,
+    ws_rx: St,
     client_to_app_tx: Sender<Message>,
-    mut app_to_client_rx: Receiver<Message>,
+    app_to_client_rx: Receiver<Message>,
     on_close_tx: OnceSender<(Option<CloseFrame<'static>>, Option<Error>)>,
 ) where
-    Si: Sink<tungstenite::Message, Error = Error> + Unpin,
-    St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
+    Si: Sink<tungstenite::Message, Error = Error> + Unpin + Send + 'static,
+    St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin + Send + 'static,
 {
     let (error_tx, mut error_rx) = mpsc::channel(1);
     let (close_frame_tx, mut close_frame_rx) = mpsc::channel(1);
 
-    let (reader_stopped_tx, reader_stopped_rx) = oneshot::channel();
-    let (writer_stopped_tx, writer_stopped_rx) = oneshot::channel();
+    let cancellation_token = CancellationToken::new();
 
-    // Run reader and writer as different futures to avoid potential
+    // Run reader and writer as different tasks to avoid potential
     // deadlock. A simpler approach would have been to `select` over
     // both receivers (from the websocket and from the application) in
     // the same future however this could lead to a deadlock if both
     // the client and application `await` on a send to each other when
     // both channels are full.
-    let writer = async {
-        write_to_socket(
-            writer_stopped_rx,
-            &error_tx.clone(),
-            &mut app_to_client_rx,
-            &mut ws_tx,
-        )
-        .await;
+    let reader_task = spawn_reader_task(
+        cancellation_token.clone(),
+        close_frame_tx,
+        error_tx.clone(),
+        client_to_app_tx,
+        ws_rx,
+    );
 
-        // Let reader know it should stop
-        reader_stopped_tx.send(()).ok();
+    let writer_task = spawn_writer_task(
+        cancellation_token.clone(),
+        error_tx,
+        app_to_client_rx,
+        ws_tx,
+    );
 
-        // Close receiver
-        close_and_drain_receiver(app_to_client_rx).await;
+    let (reader_result, writer_result) = join!(reader_task, writer_task);
 
-        ws_tx
-    };
+    // Tasks aren't cancelled so errors can only occur on panic, so unwrap to forward those
+    let (ws_rx, ws_tx) = (reader_result.unwrap(), writer_result.unwrap());
 
-    let reader = async {
-        read_from_socket(
-            reader_stopped_rx,
-            &close_frame_tx,
-            &error_tx,
-            client_to_app_tx,
-            &mut ws_rx,
-        )
-        .await;
-
-        // Let writer know it should stop
-        writer_stopped_tx.send(()).ok();
-
-        ws_rx
-    };
-
-    let (ws_tx, ws_rx) = join!(writer, reader);
-
-    // Close websocket if required
     close_websocket(close_timeout, ws_tx, ws_rx).await;
 
     // Let the application know we've closed, and forward the close
@@ -232,84 +216,128 @@ async fn run_inner<Si, St>(
     on_close_tx.send((seen_close_frame, seen_error)).ok();
 }
 
+fn spawn_reader_task<S>(
+    cancellation_token: CancellationToken,
+    close_frame_tx: Sender<CloseFrame<'static>>,
+    error_tx: Sender<Error>,
+    app_tx: Sender<Message>,
+    mut socket: S,
+) -> JoinHandle<S>
+where
+    S: Stream<Item = Result<tungstenite::Message, Error>> + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let cancelled = cancellation_token.cancelled();
+
+        let reader = read_from_socket(close_frame_tx, error_tx, app_tx, &mut socket);
+
+        select! {
+            _ = cancelled => {},
+            _ = reader => {
+                cancellation_token.cancel();
+            }
+        }
+
+        socket
+    })
+}
+
+fn spawn_writer_task<S>(
+    cancellation_token: CancellationToken,
+    error_tx: Sender<Error>,
+    mut app_rx: Receiver<Message>,
+    mut socket: S,
+) -> JoinHandle<S>
+where
+    S: Sink<tungstenite::Message, Error = Error> + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let cancelled = cancellation_token.cancelled();
+
+        let writer = write_to_socket(error_tx, &mut app_rx, &mut socket);
+
+        select! {
+            _ = cancelled => {},
+            _ = writer => {
+                cancellation_token.cancel();
+            }
+        }
+
+        close_and_drain_receiver(app_rx).await;
+
+        socket
+    })
+}
+
 /// Read messages from `socket` and forward them to the application.
 async fn read_from_socket<S>(
-    mut shutdown: OnceReceiver<()>,
-    close_frame_tx: &Sender<CloseFrame<'static>>,
-    error_tx: &Sender<Error>,
+    close_frame_tx: Sender<CloseFrame<'static>>,
+    error_tx: Sender<Error>,
     app_tx: Sender<Message>,
     socket: &mut S,
 ) where
     S: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
 {
     loop {
-        select! {
-            _ = &mut shutdown => break,
-            ws_msg = socket.next() => match ws_msg {
-                None => break,
-                Some(ws_msg) => match ws_msg {
-                    Ok(ws_msg) => {
-                        let msg = match ws_msg {
-                            tungstenite::Message::Text(s) => Message::Text(s),
-                            tungstenite::Message::Binary(b) => Message::Binary(b),
-                            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) | tungstenite::Message::Frame(_) => continue,
-                            tungstenite::Message::Close(frame) => {
-                                if let Some(f) = frame {
-                                    close_frame_tx.try_send(f).ok();
-                                }
-                                continue;
-                            },
-                        };
+        match socket.next().await {
+            None => break,
+            Some(ws_msg) => match ws_msg {
+                Ok(ws_msg) => {
+                    let msg = match ws_msg {
+                        tungstenite::Message::Text(s) => Message::Text(s),
+                        tungstenite::Message::Binary(b) => Message::Binary(b),
+                        tungstenite::Message::Ping(_)
+                        | tungstenite::Message::Pong(_)
+                        | tungstenite::Message::Frame(_) => continue,
+                        tungstenite::Message::Close(frame) => {
+                            if let Some(f) = frame {
+                                close_frame_tx.try_send(f).ok();
+                            }
+                            continue;
+                        }
+                    };
 
-                        if app_tx.send(msg).await.is_err() {
-                            break
-                        }
-                    }
-                    Err(e) => {
-                        if let Error::ConnectionClosed | Error::AlreadyClosed = e {
-                            // Do nothing, stream will close shortly
-                        } else {
-                            error_tx.try_send(e).ok();
-                            break;
-                        }
+                    if app_tx.send(msg).await.is_err() {
+                        break;
                     }
                 }
-            }
+                Err(e) => {
+                    if let Error::ConnectionClosed | Error::AlreadyClosed = e {
+                        // Do nothing, stream will close shortly
+                    } else {
+                        error_tx.try_send(e).ok();
+                        break;
+                    }
+                }
+            },
         }
     }
 }
 
 /// Read messages from the application via `app_rx` and send them down
 /// `socket`.
-async fn write_to_socket<S>(
-    mut shutdown: OnceReceiver<()>,
-    error_tx: &Sender<Error>,
-    app_rx: &mut Receiver<Message>,
-    socket: &mut S,
-) where
+async fn write_to_socket<S>(error_tx: Sender<Error>, app_rx: &mut Receiver<Message>, socket: &mut S)
+where
     S: Sink<tungstenite::Message, Error = Error> + Unpin,
 {
     loop {
-        select! {
-           _ = &mut shutdown => break,
-           msg_to_send = app_rx.recv() => match msg_to_send {
-               None => break,
-               Some(msg_to_send) => {
-                   let ws_msg = match msg_to_send {
-                       Message::Text(s) => tungstenite::Message::Text(s),
-                       Message::Binary(b) => tungstenite::Message::Binary(b)
-                   };
+        match app_rx.recv().await {
+            None => break,
+            Some(msg_to_send) => {
+                let ws_msg = match msg_to_send {
+                    Message::Text(s) => tungstenite::Message::Text(s),
+                    Message::Binary(b) => tungstenite::Message::Binary(b),
+                };
 
-                   if let Err(e) = socket.send(ws_msg).await {
-                       if let Error::ConnectionClosed | Error::AlreadyClosed = e {
-                           // Do nothing, stream will close shortly
-                       } else {
-                           error_tx.try_send(e).ok();
-                           break;
-                       }
-                   }
-               }
-           }
+                if let Err(e) = socket.send(ws_msg).await {
+                    if let Error::ConnectionClosed | Error::AlreadyClosed = e {
+                        // Do nothing, stream will close shortly
+                    } else {
+                        error_tx.try_send(e).ok();
+                        break;
+                    }
+                }
+            }
         }
     }
 }
