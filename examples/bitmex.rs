@@ -27,7 +27,7 @@ async fn main() {
     let reader_task = async move {
         let NewConnection {
             channels: (tx, mut rx),
-            connection_closed,
+            on_close: connection_closed,
         } = new_connection_rx.recv().await.unwrap().unwrap();
 
         println!("message received: {:?}", rx.recv().await.unwrap());

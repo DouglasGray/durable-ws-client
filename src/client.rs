@@ -23,7 +23,7 @@ pub enum Message {
 #[derive(Debug)]
 pub struct NewConnection {
     pub channels: (Sender<Message>, Receiver<Message>),
-    pub connection_closed: OnceReceiver<(Option<CloseFrame<'static>>, Option<Error>)>,
+    pub on_close: OnceReceiver<(Option<CloseFrame<'static>>, Option<Error>)>,
 }
 
 #[derive(Debug)]
@@ -108,14 +108,14 @@ async fn run<C, B>(
 
                 let (to_client_tx, to_client_rx) = mpsc::channel(config.channel_size());
                 let (to_app_tx, to_app_rx) = mpsc::channel(config.channel_size());
-                let (close_finished_tx, close_finished_rx) = oneshot::channel();
+                let (on_close_tx, on_close_rx) = oneshot::channel();
 
                 // Connection has been successful, pass the channels
                 // to the application
                 if listener
                     .send(Ok(NewConnection {
                         channels: (to_client_tx, to_app_rx),
-                        connection_closed: close_finished_rx,
+                        on_close: on_close_rx,
                     }))
                     .await
                     .is_err()
@@ -129,7 +129,7 @@ async fn run<C, B>(
                     ws_rx,
                     to_app_tx,
                     to_client_rx,
-                    close_finished_tx,
+                    on_close_tx,
                 )
                 .await;
             }
@@ -168,7 +168,7 @@ async fn run_inner<Si, St>(
     mut ws_rx: St,
     client_to_app_tx: Sender<Message>,
     mut app_to_client_rx: Receiver<Message>,
-    connection_closed_tx: OnceSender<(Option<CloseFrame<'static>>, Option<Error>)>,
+    on_close_tx: OnceSender<(Option<CloseFrame<'static>>, Option<Error>)>,
 ) where
     Si: Sink<tungstenite::Message, Error = Error> + Unpin,
     St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
@@ -229,9 +229,7 @@ async fn run_inner<Si, St>(
     let seen_close_frame = close_frame_rx.try_recv().ok();
     let seen_error = error_rx.try_recv().ok();
 
-    connection_closed_tx
-        .send((seen_close_frame, seen_error))
-        .ok();
+    on_close_tx.send((seen_close_frame, seen_error)).ok();
 }
 
 /// Read messages from `socket` and forward them to the application.
