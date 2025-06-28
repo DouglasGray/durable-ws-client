@@ -1,6 +1,6 @@
 [package]
 name = "durable-ws-client"
-version = "3.0.0"
+version = "4.0.0"
 authors = ["Douglas Gray <dbgray01@gmail.com>"]
 edition = "2021"
 
