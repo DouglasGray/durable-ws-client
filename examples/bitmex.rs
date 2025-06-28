@@ -1,16 +1,15 @@
 use durable_ws_client::{
-    backoff::FixedBackoff,
     client::{NewConnection, ReconnectingClient},
     config::Config,
     connection::WebSocketBuilder,
 };
-use std::time::Duration;
 use tokio::{join, sync::mpsc};
+use tower::retry::backoff::ExponentialBackoffMaker;
 
 #[tokio::main]
 async fn main() {
     let websocket = WebSocketBuilder;
-    let backoff = FixedBackoff::new(Duration::from_secs(1));
+    let backoff_builder = ExponentialBackoffMaker::default();
 
     let (new_connection_tx, mut new_connection_rx) = mpsc::channel(1);
 
@@ -19,7 +18,7 @@ async fn main() {
             Config::default(),
             "wss://www.bitmex.com/realtime".parse().unwrap(),
             websocket,
-            backoff,
+            backoff_builder,
             new_connection_tx,
         )
         .await;

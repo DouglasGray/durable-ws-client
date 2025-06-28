@@ -1,6 +1,6 @@
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use std::{error::Error as StdError, fmt, time::Duration};
 use http::Uri;
+use std::{error::Error as StdError, fmt, time::Duration};
 use tokio::{
     join, select,
     sync::{
@@ -10,8 +10,9 @@ use tokio::{
     time,
 };
 use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Error};
+use tower::retry::backoff::{Backoff, MakeBackoff};
 
-use crate::{backoff::BackoffGenerator, config::Config, connection::Connector};
+use crate::{config::Config, connection::Connector};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Message {
@@ -63,11 +64,11 @@ impl ReconnectingClient {
         config: Config,
         url: Uri,
         connection_builder: C,
-        backoff_generator: B,
+        backoff_builder: B,
         connection_listener: Sender<Result<NewConnection, ConnectError>>,
     ) where
         C: Connector + Send + 'static,
-        B: BackoffGenerator + Send + 'static,
+        B: MakeBackoff + Send + 'static,
         C::Sender: Send + Unpin,
         C::Receiver: Send + Unpin,
     {
@@ -75,7 +76,7 @@ impl ReconnectingClient {
             config,
             url,
             connection_builder,
-            backoff_generator,
+            backoff_builder,
             connection_listener,
         )
         .await;
@@ -86,20 +87,22 @@ async fn run<C, B>(
     config: Config,
     url: Uri,
     mut connection_builder: C,
-    mut backoff_generator: B,
+    mut backoff_builder: B,
     listener: Sender<Result<NewConnection, ConnectError>>,
 ) where
     C: Connector + Send + 'static,
-    B: BackoffGenerator + Send + 'static,
+    B: MakeBackoff + Send + 'static,
     C::Sender: Send + Unpin,
     C::Receiver: Send + Unpin,
 {
+    let mut backoff = backoff_builder.make_backoff();
+
     loop {
         let res = connect(config, &url, &mut connection_builder).await;
 
         match res {
             Ok(s) => {
-                backoff_generator.reset();
+                backoff = backoff_builder.make_backoff();
 
                 let (ws_tx, ws_rx) = s;
 
@@ -137,9 +140,7 @@ async fn run<C, B>(
             }
         }
 
-        let wait_for = backoff_generator.next_delay();
-
-        time::sleep(wait_for).await;
+        backoff.next_backoff().await;
     }
 }
 
