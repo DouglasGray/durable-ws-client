@@ -155,7 +155,7 @@ async fn connect<C>(
 where
     C: Connector,
 {
-    let connection = connection_builder.connect(config.ws_config(), &url, config.disable_nagle());
+    let connection = connection_builder.connect(config.ws_config(), url, config.disable_nagle());
 
     if let Ok(res) = time::timeout(config.connect_timeout(), connection).await {
         res.map(|(tx, rx, _)| (tx, rx)).map_err(Into::into)
@@ -352,7 +352,7 @@ where
     // seen errors, if any.
     let close_websocket = ws_tx.send(tungstenite::Message::Close(None));
 
-    let drain_receiver = async { while let Some(_) = ws_rx.next().await {} };
+    let drain_receiver = async { while ws_rx.next().await.is_some() {} };
 
     let close_and_drain = async { join!(close_websocket, drain_receiver) };
 
@@ -362,5 +362,5 @@ where
 async fn close_and_drain_receiver<T>(mut rx: Receiver<T>) {
     rx.close();
 
-    while let Some(_) = rx.recv().await {}
+    while rx.recv().await.is_some() {}
 }
