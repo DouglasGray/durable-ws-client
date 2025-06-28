@@ -57,7 +57,7 @@ impl Default for ConfigBuilder {
             ws_config: None,
             connect_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(10),
-            channel_size: 1024,
+            channel_size: 32,
             disable_nagle: false,
         }
     }
@@ -101,7 +101,7 @@ impl Default for Config {
             ws_config: None,
             connect_timeout: Duration::from_secs(10),
             close_timeout: Duration::from_secs(10),
-            channel_size: 1024,
+            channel_size: 32,
             disable_nagle: false,
         }
     }
