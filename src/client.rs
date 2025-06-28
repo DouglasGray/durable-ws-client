@@ -1,5 +1,6 @@
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use std::{error::Error as StdError, fmt, time::Duration};
+use http::Uri;
 use tokio::{
     join, select,
     sync::{
@@ -9,7 +10,6 @@ use tokio::{
     time,
 };
 use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Error};
-use url::Url;
 
 use crate::{backoff::BackoffGenerator, config::Config, connection::Connector};
 
@@ -61,7 +61,7 @@ pub struct ReconnectingClient;
 impl ReconnectingClient {
     pub async fn connect<C, B>(
         config: Config,
-        url: Url,
+        url: Uri,
         connection_builder: C,
         backoff_generator: B,
         connection_listener: Sender<Result<NewConnection, ConnectError>>,
@@ -84,7 +84,7 @@ impl ReconnectingClient {
 
 async fn run<C, B>(
     config: Config,
-    url: Url,
+    url: Uri,
     mut connection_builder: C,
     mut backoff_generator: B,
     listener: Sender<Result<NewConnection, ConnectError>>,
@@ -146,7 +146,7 @@ async fn run<C, B>(
 /// Try open a connection to `url`.
 async fn connect<C>(
     config: Config,
-    url: &Url,
+    url: &Uri,
     connection_builder: &mut C,
 ) -> Result<(C::Sender, C::Receiver), ConnectError>
 where
