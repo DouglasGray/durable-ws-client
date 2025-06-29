@@ -229,15 +229,16 @@ where
     S: Stream<Item = Result<tungstenite::Message, Error>> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let cancelled = cancellation_token.cancelled();
+        let cloned_cancellation_token = cancellation_token.clone();
+        let cancelled = cloned_cancellation_token.cancelled();
+
+        let _cancel_on_drop = cancellation_token.drop_guard();
 
         let reader = read_from_socket(close_frame_tx, error_tx, app_tx, &mut socket);
 
         select! {
             _ = cancelled => {},
-            _ = reader => {
-                cancellation_token.cancel();
-            }
+            _ = reader => {}
         }
 
         socket
@@ -254,15 +255,16 @@ where
     S: Sink<tungstenite::Message, Error = Error> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let cancelled = cancellation_token.cancelled();
+        let cloned_cancellation_token = cancellation_token.clone();
+        let cancelled = cloned_cancellation_token.cancelled();
+
+        let _cancel_on_drop = cancellation_token.drop_guard();
 
         let writer = write_to_socket(error_tx, &mut app_rx, &mut socket);
 
         select! {
             _ = cancelled => {},
-            _ = writer => {
-                cancellation_token.cancel();
-            }
+            _ = writer => {}
         }
 
         close_and_drain_receiver(app_rx).await;
