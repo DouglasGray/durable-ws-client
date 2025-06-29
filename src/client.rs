@@ -58,16 +58,24 @@ impl From<Error> for ConnectError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReconnectingClient;
+#[derive(Debug)]
+pub struct ReconnectingClient {
+    connection_tx: Sender<Result<NewConnection, ConnectError>>,
+}
 
 impl ReconnectingClient {
+    pub fn new() -> (Self, Receiver<Result<NewConnection, ConnectError>>) {
+        let (connection_tx, connection_rx) = mpsc::channel(1);
+
+        (Self { connection_tx }, connection_rx)
+    }
+
     pub async fn connect<C, B>(
+        self,
         config: Config,
         url: Uri,
         connection_builder: C,
         backoff_builder: Option<B>,
-        connection_listener: Sender<Result<NewConnection, ConnectError>>,
     ) where
         C: Connector + Send + 'static,
         B: MakeBackoff + Send + 'static,
@@ -79,7 +87,7 @@ impl ReconnectingClient {
             url,
             connection_builder,
             backoff_builder,
-            connection_listener,
+            self.connection_tx,
         )
         .await;
     }
@@ -100,6 +108,12 @@ async fn run<C, B>(
     let mut backoff = backoff_builder.as_mut().map(|b| b.make_backoff());
 
     loop {
+        let permit = if let Ok(p) = listener.reserve().await {
+            p
+        } else {
+            return;
+        };
+
         let res = connect(config, &url, &mut connection_builder).await;
 
         match res {
@@ -114,16 +128,10 @@ async fn run<C, B>(
 
                 // Connection has been successful, pass the channels
                 // to the application
-                if listener
-                    .send(Ok(NewConnection {
-                        channels: (to_client_tx, to_app_rx),
-                        on_close: on_close_rx,
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                permit.send(Ok(NewConnection {
+                    channels: (to_client_tx, to_app_rx),
+                    on_close: on_close_rx,
+                }));
 
                 run_inner(
                     config.close_timeout(),
@@ -136,9 +144,7 @@ async fn run<C, B>(
                 .await;
             }
             Err(e) => {
-                if listener.send(Err(e)).await.is_err() {
-                    return;
-                }
+                permit.send(Err(e));
             }
         }
 
