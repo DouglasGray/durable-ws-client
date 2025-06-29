@@ -66,7 +66,7 @@ impl ReconnectingClient {
         config: Config,
         url: Uri,
         connection_builder: C,
-        backoff_builder: B,
+        backoff_builder: Option<B>,
         connection_listener: Sender<Result<NewConnection, ConnectError>>,
     ) where
         C: Connector + Send + 'static,
@@ -89,7 +89,7 @@ async fn run<C, B>(
     config: Config,
     url: Uri,
     mut connection_builder: C,
-    mut backoff_builder: B,
+    mut backoff_builder: Option<B>,
     listener: Sender<Result<NewConnection, ConnectError>>,
 ) where
     C: Connector + Send + 'static,
@@ -97,14 +97,14 @@ async fn run<C, B>(
     C::Sender: Send + Unpin,
     C::Receiver: Send + Unpin,
 {
-    let mut backoff = backoff_builder.make_backoff();
+    let mut backoff = backoff_builder.as_mut().map(|b| b.make_backoff());
 
     loop {
         let res = connect(config, &url, &mut connection_builder).await;
 
         match res {
             Ok(s) => {
-                backoff = backoff_builder.make_backoff();
+                backoff = backoff_builder.as_mut().map(|b| b.make_backoff());
 
                 let (ws_tx, ws_rx) = s;
 
@@ -142,7 +142,9 @@ async fn run<C, B>(
             }
         }
 
-        backoff.next_backoff().await;
+        if let Some(b) = &mut backoff {
+            b.next_backoff().await;
+        }
     }
 }
 

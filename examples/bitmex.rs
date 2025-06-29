@@ -8,7 +8,7 @@ use tower::retry::backoff::ExponentialBackoffMaker;
 
 #[tokio::main]
 async fn main() {
-    let websocket = WebSocketBuilder;
+    let websocket_builder = WebSocketBuilder;
     let backoff_builder = ExponentialBackoffMaker::default();
 
     let (new_connection_tx, mut new_connection_rx) = mpsc::channel(1);
@@ -17,8 +17,8 @@ async fn main() {
         ReconnectingClient::connect(
             Config::default(),
             "wss://www.bitmex.com/realtime".parse().unwrap(),
-            websocket,
-            backoff_builder,
+            websocket_builder,
+            backoff_builder.into(),
             new_connection_tx,
         )
         .await;
