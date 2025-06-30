@@ -117,10 +117,8 @@ async fn run<C, B>(
         let res = connect(config, &url, &mut connection_builder).await;
 
         match res {
-            Ok(s) => {
+            Ok((ws_tx, ws_rx)) => {
                 backoff = backoff_builder.as_mut().map(|b| b.make_backoff());
-
-                let (ws_tx, ws_rx) = s;
 
                 let (to_client_tx, to_client_rx) = mpsc::channel(config.channel_size());
                 let (to_app_tx, to_app_rx) = mpsc::channel(config.channel_size());
@@ -235,10 +233,8 @@ where
     S: Stream<Item = Result<tungstenite::Message, Error>> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let cloned_cancellation_token = cancellation_token.clone();
-        let cancelled = cloned_cancellation_token.cancelled();
-
-        let _cancel_on_drop = cancellation_token.drop_guard();
+        let cancelled = cancellation_token.cancelled();
+        let _cancel_on_drop = cancellation_token.clone().drop_guard();
 
         let reader = read_from_socket(close_frame_tx, error_tx, app_tx, &mut socket);
 
@@ -261,10 +257,8 @@ where
     S: Sink<tungstenite::Message, Error = Error> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let cloned_cancellation_token = cancellation_token.clone();
-        let cancelled = cloned_cancellation_token.cancelled();
-
-        let _cancel_on_drop = cancellation_token.drop_guard();
+        let cancelled = cancellation_token.cancelled();
+        let _cancel_on_drop = cancellation_token.clone().drop_guard();
 
         let writer = write_to_socket(error_tx, &mut app_rx, &mut socket);
 
