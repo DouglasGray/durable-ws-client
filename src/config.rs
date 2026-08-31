@@ -1,9 +1,9 @@
 use std::time::Duration;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use yawc::Options;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConfigBuilder {
-    ws_config: Option<WebSocketConfig>,
+    ws_config: Option<Options>,
     connect_timeout: Duration,
     close_timeout: Duration,
     channel_size: usize,
@@ -15,7 +15,7 @@ impl ConfigBuilder {
         Self::default()
     }
 
-    pub fn ws_config(&mut self, config: WebSocketConfig) -> &mut Self {
+    pub fn ws_config(&mut self, config: Options) -> &mut Self {
         self.ws_config = Some(config);
         self
     }
@@ -42,7 +42,7 @@ impl ConfigBuilder {
 
     pub fn build(&self) -> Config {
         Config {
-            ws_config: self.ws_config,
+            ws_config: self.ws_config.clone(),
             connect_timeout: self.connect_timeout,
             close_timeout: self.close_timeout,
             channel_size: self.channel_size,
@@ -64,9 +64,12 @@ impl Default for ConfigBuilder {
 }
 
 /// WebSocket client configuration.
-#[derive(Debug, Clone, Copy)]
+///
+/// `Options` is not `Copy`, so neither is this; it is cloned once per
+/// connection attempt.
+#[derive(Debug, Clone)]
 pub struct Config {
-    ws_config: Option<WebSocketConfig>,
+    ws_config: Option<Options>,
     connect_timeout: Duration,
     close_timeout: Duration,
     channel_size: usize,
@@ -74,8 +77,8 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn ws_config(&self) -> Option<WebSocketConfig> {
-        self.ws_config
+    pub fn ws_config(&self) -> Option<&Options> {
+        self.ws_config.as_ref()
     }
 
     pub fn connect_timeout(&self) -> Duration {

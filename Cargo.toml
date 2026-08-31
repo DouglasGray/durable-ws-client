@@ -2,29 +2,31 @@
 name = "durable-ws-client"
 version = "5.0.0"
 authors = ["Douglas Gray <dbgray01@gmail.com>"]
-edition = "2021"
+edition = "2024"
 
 [features]
-default = ["tokio-tungstenite/default"]
-connect = ["tokio-tungstenite/connect"]
-native-tls = ["tokio-tungstenite/native-tls"]
-native-tls-vendored = ["tokio-tungstenite/native-tls-vendored"]
-rustls-tls-native-roots = ["tokio-tungstenite/rustls-tls-native-roots"]
-rustls-tls-webpki-roots = ["tokio-tungstenite/rustls-tls-webpki-roots"]
-webpki-roots = ["tokio-tungstenite/webpki-roots"]
-tokio-rustls = ["tokio-tungstenite/tokio-rustls"]
-native-tls-crate = ["tokio-tungstenite/native-tls-crate"]
-rustls-native-certs = ["tokio-tungstenite/rustls-native-certs"]
-tokio-native-tls = ["tokio-tungstenite/tokio-native-tls"]
-rustls = ["tokio-tungstenite/rustls"]
+default = ["rustls-ring"]
+# TLS backends. yawc is rustls-only, so the crypto provider is chosen here.
+rustls-ring = ["yawc/rustls-ring"]
+rustls-aws-lc-rs = ["yawc/rustls-aws-lc-rs"]
+# Use zlib-rs for permessage-deflate instead of the default miniz backend.
+zlib = ["yawc/zlib"]
+# SIMD-accelerated UTF-8 validation inside yawc.
+simd = ["yawc/simd"]
 
 [dependencies]
+bytes = "1.11"
 futures = "0.3.31"
 tokio = { version = "1.41.0", features = ["net", "sync", "time", "macros", "rt"] }
-tokio-tungstenite = { version = "0.24.0" }
+tokio-rustls = { version = "0.26", default-features = false }
 tokio-util = "0.7.12"
 tower = { version = "0.5.1", features = ["retry"] }
 http = "1.1.0"
+url = "2"
+yawc = { version = "0.3.4", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.41.0", features = ["rt-multi-thread"] }
+base64 = "0.22"
+sha1 = "0.10"
+tokio = { version = "1.41.0", features = ["rt-multi-thread", "io-util"] }
+tokio-util = { version = "0.7.12", features = ["codec"] }
