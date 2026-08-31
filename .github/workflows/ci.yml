@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - features: default
+            cargo_args: ""
+          # No crypto provider is selected, so this is a compile check only:
+          # rustls has nothing to build a client config from at runtime.
+          - features: none
+            cargo_args: "--no-default-features"
+          - features: rustls-aws-lc-rs
+            cargo_args: "--no-default-features --features=rustls-aws-lc-rs"
+          - features: zlib,simd
+            cargo_args: "--features=zlib,simd"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --all-targets ${{ matrix.cargo_args }}
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+      # The example serves itself over a local port and exits on its own, so
+      # it doubles as an end-to-end smoke test.
+      - run: cargo run --example echo
+
+  # The connection teardown is timing sensitive: which of the reader and writer
+  # finishes first decides what the application is told about the close. A
+  # single green run says little about that, so run the suite repeatedly, and
+  # once without the scheduler's parallelism hiding an ordering bug.
+  test-repeat:
+    name: Test (repeated)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --no-run --all-targets
+      - run: for i in $(seq 1 25); do cargo test --all-targets || exit 1; done
+      - run: cargo test --all-targets -- --test-threads=1
+
+  # Cargo.lock is not committed, so downstream users resolve dependencies
+  # themselves. This checks that the lowest versions this crate claims to
+  # accept are versions it actually builds and passes its tests against.
+  # Resolved with nightly, for the -Z flag, but built and run with stable.
+  minimal-versions:
+    name: Minimal versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo +nightly generate-lockfile -Z direct-minimal-versions
+      - run: cargo test --all-targets
+
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Covers the unsafe in `Utf8Bytes`, which upholds its UTF-8 invariant by
+      # construction rather than by checking on every access.
+      - run: cargo miri test --lib
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --all-targets -- -D warnings
