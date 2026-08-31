@@ -10,27 +10,26 @@ use tokio::{
     },
     time,
 };
-use tokio_tungstenite::tungstenite::{self, protocol::CloseFrame, Error};
 use tokio_util::sync::CancellationToken;
 use tower::retry::backoff::{Backoff, MakeBackoff};
+use yawc::{
+    WebSocketError,
+    frame::{Frame, OpCode},
+};
 
 use crate::{config::Config, connection::Connector};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Message {
-    Text(String),
-    Binary(Vec<u8>),
-}
+pub use crate::message::{CloseCode, CloseFrame, Message, Utf8Bytes};
 
 #[derive(Debug)]
 pub struct NewConnection {
     pub channels: (Sender<Message>, Receiver<Message>),
-    pub on_close: OnceReceiver<(Option<CloseFrame<'static>>, Option<Error>)>,
+    pub on_close: OnceReceiver<(Option<CloseFrame>, Option<WebSocketError>)>,
 }
 
 #[derive(Debug)]
 pub enum ConnectError {
-    Inner(Error),
+    Inner(WebSocketError),
     TimedOut,
 }
 
@@ -52,8 +51,8 @@ impl StdError for ConnectError {
     }
 }
 
-impl From<Error> for ConnectError {
-    fn from(e: Error) -> Self {
+impl From<WebSocketError> for ConnectError {
+    fn from(e: WebSocketError) -> Self {
         Self::Inner(e)
     }
 }
@@ -114,7 +113,7 @@ async fn run<C, B>(
             return;
         };
 
-        let res = connect(config, &url, &mut connection_builder).await;
+        let res = connect(&config, &url, &mut connection_builder).await;
 
         match res {
             Ok((ws_tx, ws_rx)) => {
@@ -154,17 +153,18 @@ async fn run<C, B>(
 
 /// Try open a connection to `url`.
 async fn connect<C>(
-    config: Config,
+    config: &Config,
     url: &Uri,
     connection_builder: &mut C,
 ) -> Result<(C::Sender, C::Receiver), ConnectError>
 where
     C: Connector,
 {
-    let connection = connection_builder.connect(config.ws_config(), url, config.disable_nagle());
+    let connection =
+        connection_builder.connect(config.ws_config().cloned(), url, config.disable_nagle());
 
     if let Ok(res) = time::timeout(config.connect_timeout(), connection).await {
-        res.map(|(tx, rx, _)| (tx, rx)).map_err(Into::into)
+        res.map_err(Into::into)
     } else {
         Err(ConnectError::TimedOut)
     }
@@ -176,10 +176,10 @@ async fn run_inner<Si, St>(
     ws_rx: St,
     client_to_app_tx: Sender<Message>,
     app_to_client_rx: Receiver<Message>,
-    on_close_tx: OnceSender<(Option<CloseFrame<'static>>, Option<Error>)>,
+    on_close_tx: OnceSender<(Option<CloseFrame>, Option<WebSocketError>)>,
 ) where
-    Si: Sink<tungstenite::Message, Error = Error> + Unpin + Send + 'static,
-    St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin + Send + 'static,
+    Si: Sink<Frame, Error = WebSocketError> + Unpin + Send + 'static,
+    St: Stream<Item = Result<Frame, WebSocketError>> + Unpin + Send + 'static,
 {
     let (error_tx, mut error_rx) = mpsc::channel(1);
     let (close_frame_tx, mut close_frame_rx) = mpsc::channel(1);
@@ -192,7 +192,13 @@ async fn run_inner<Si, St>(
     // the same future however this could lead to a deadlock if both
     // the client and application `await` on a send to each other when
     // both channels are full.
-    let reader_task = spawn_reader_task(
+    //
+    // Only the reader cancels the writer, which would otherwise wait on the
+    // application forever once the socket is gone. Cancelling the reader in
+    // turn would make what the application learns about the close depend on
+    // when it drops its channels, as the frames still unread at that point
+    // include the peer's close frame and any protocol error.
+    let mut reader_task = spawn_reader_task(
         cancellation_token.clone(),
         close_frame_tx,
         error_tx.clone(),
@@ -200,19 +206,34 @@ async fn run_inner<Si, St>(
         ws_rx,
     );
 
-    let writer_task = spawn_writer_task(
-        cancellation_token.clone(),
-        error_tx,
-        app_to_client_rx,
-        ws_tx,
+    let writer_task = spawn_writer_task(cancellation_token, error_tx, app_to_client_rx, ws_tx);
+
+    // The writer finishing means the application has stopped sending, either
+    // because it dropped its sender or because the reader cancelled it.
+    // Tasks aren't cancelled so errors can only occur on panic, so unwrap to forward those
+    let mut ws_tx = writer_task.await.unwrap();
+
+    // Send a close frame so the peer closes in turn, and give the reader until
+    // `close_timeout` to see its close and reach end of stream.
+    //
+    // Note this sends a close frame rather than closing the sink: shutting the
+    // sink down would also shut down the socket's write side, which the reader
+    // still needs to flush the close frame yawc echoes on its behalf.
+    let (_, drained) = join!(
+        time::timeout(
+            close_timeout,
+            ws_tx.send(Frame::close(CloseCode::Normal, []))
+        ),
+        time::timeout(close_timeout, &mut reader_task),
     );
 
-    let (reader_result, writer_result) = join!(reader_task, writer_task);
-
-    // Tasks aren't cancelled so errors can only occur on panic, so unwrap to forward those
-    let (ws_rx, ws_tx) = (reader_result.unwrap(), writer_result.unwrap());
-
-    close_websocket(close_timeout, ws_tx, ws_rx).await;
+    match drained {
+        Ok(reader_result) => {
+            reader_result.unwrap();
+        }
+        // A peer that never closes must not wedge the connection loop.
+        Err(_) => reader_task.abort(),
+    }
 
     // Let the application know we've closed, and forward the close
     // frame and any errors
@@ -222,43 +243,37 @@ async fn run_inner<Si, St>(
     on_close_tx.send((seen_close_frame, seen_error)).ok();
 }
 
+/// Reads until the socket ends, cancelling the writer on its way out.
 fn spawn_reader_task<S>(
     cancellation_token: CancellationToken,
-    close_frame_tx: Sender<CloseFrame<'static>>,
-    error_tx: Sender<Error>,
+    close_frame_tx: Sender<CloseFrame>,
+    error_tx: Sender<WebSocketError>,
     app_tx: Sender<Message>,
     mut socket: S,
-) -> JoinHandle<S>
+) -> JoinHandle<()>
 where
-    S: Stream<Item = Result<tungstenite::Message, Error>> + Unpin + Send + 'static,
+    S: Stream<Item = Result<Frame, WebSocketError>> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let cancelled = cancellation_token.cancelled();
-        let _cancel_on_drop = cancellation_token.clone().drop_guard();
+        let _cancel_writer_on_drop = cancellation_token.drop_guard();
 
-        let reader = read_from_socket(close_frame_tx, error_tx, app_tx, &mut socket);
-
-        select! {
-            _ = cancelled => {},
-            _ = reader => {}
-        }
-
-        socket
+        read_from_socket(close_frame_tx, error_tx, app_tx, &mut socket).await;
     })
 }
 
+/// Writes until the application stops sending, or until the reader reports
+/// that the socket has gone.
 fn spawn_writer_task<S>(
     cancellation_token: CancellationToken,
-    error_tx: Sender<Error>,
+    error_tx: Sender<WebSocketError>,
     mut app_rx: Receiver<Message>,
     mut socket: S,
 ) -> JoinHandle<S>
 where
-    S: Sink<tungstenite::Message, Error = Error> + Unpin + Send + 'static,
+    S: Sink<Frame, Error = WebSocketError> + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
         let cancelled = cancellation_token.cancelled();
-        let _cancel_on_drop = cancellation_token.clone().drop_guard();
 
         let writer = write_to_socket(error_tx, &mut app_rx, &mut socket);
 
@@ -274,27 +289,39 @@ where
 }
 
 /// Read messages from `socket` and forward them to the application.
+///
+/// Payloads are handed over as the [`bytes::Bytes`] yawc read them into, so
+/// no message data is copied on this path.
 async fn read_from_socket<S>(
-    close_frame_tx: Sender<CloseFrame<'static>>,
-    error_tx: Sender<Error>,
+    close_frame_tx: Sender<CloseFrame>,
+    error_tx: Sender<WebSocketError>,
     app_tx: Sender<Message>,
     socket: &mut S,
 ) where
-    S: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
+    S: Stream<Item = Result<Frame, WebSocketError>> + Unpin,
 {
     loop {
         match socket.next().await {
             None => break,
-            Some(ws_msg) => match ws_msg {
-                Ok(ws_msg) => {
-                    let msg = match ws_msg {
-                        tungstenite::Message::Text(s) => Message::Text(s),
-                        tungstenite::Message::Binary(b) => Message::Binary(b),
-                        tungstenite::Message::Ping(_)
-                        | tungstenite::Message::Pong(_)
-                        | tungstenite::Message::Frame(_) => continue,
-                        tungstenite::Message::Close(frame) => {
-                            if let Some(f) = frame {
+            Some(ws_frame) => match ws_frame {
+                Ok(ws_frame) => {
+                    let msg = match ws_frame.opcode() {
+                        // yawc only validates text as UTF-8 when
+                        // `Options::check_utf8` is set, so validate here
+                        // instead: it is the scan `Utf8Bytes` needs anyway.
+                        OpCode::Text => match Utf8Bytes::try_from(ws_frame.into_payload()) {
+                            Ok(text) => Message::Text(text),
+                            Err(_) => {
+                                error_tx.try_send(WebSocketError::InvalidUTF8).ok();
+                                break;
+                            }
+                        },
+                        OpCode::Binary => Message::Binary(ws_frame.into_payload()),
+                        // Pings are answered by yawc, and continuations are
+                        // assembled before they reach us
+                        OpCode::Ping | OpCode::Pong | OpCode::Continuation => continue,
+                        OpCode::Close => {
+                            if let Some(f) = close_frame(ws_frame) {
                                 close_frame_tx.try_send(f).ok();
                             }
                             continue;
@@ -306,7 +333,7 @@ async fn read_from_socket<S>(
                     }
                 }
                 Err(e) => {
-                    if let Error::ConnectionClosed | Error::AlreadyClosed = e {
+                    if e.is_closed() {
                         // Do nothing, stream will close shortly
                     } else {
                         error_tx.try_send(e).ok();
@@ -318,23 +345,40 @@ async fn read_from_socket<S>(
     }
 }
 
+/// Split a close frame into the status code and reason the application sees.
+///
+/// A peer may close without a status code, in which case the payload is empty
+/// and there is nothing to report.
+fn close_frame(frame: Frame) -> Option<CloseFrame> {
+    let code = frame.close_code()?;
+
+    // The first two bytes are the status code; the rest, if any, is the
+    // reason. Slicing shares the payload rather than copying it.
+    let reason = Utf8Bytes::try_from(frame.into_payload().slice(2..)).unwrap_or_default();
+
+    Some(CloseFrame { code, reason })
+}
+
 /// Read messages from the application via `app_rx` and send them down
 /// `socket`.
-async fn write_to_socket<S>(error_tx: Sender<Error>, app_rx: &mut Receiver<Message>, socket: &mut S)
-where
-    S: Sink<tungstenite::Message, Error = Error> + Unpin,
+async fn write_to_socket<S>(
+    error_tx: Sender<WebSocketError>,
+    app_rx: &mut Receiver<Message>,
+    socket: &mut S,
+) where
+    S: Sink<Frame, Error = WebSocketError> + Unpin,
 {
     loop {
         match app_rx.recv().await {
             None => break,
             Some(msg_to_send) => {
-                let ws_msg = match msg_to_send {
-                    Message::Text(s) => tungstenite::Message::Text(s),
-                    Message::Binary(b) => tungstenite::Message::Binary(b),
+                let ws_frame = match msg_to_send {
+                    Message::Text(s) => Frame::text(s.into_bytes()),
+                    Message::Binary(b) => Frame::binary(b),
                 };
 
-                if let Err(e) = socket.send(ws_msg).await {
-                    if let Error::ConnectionClosed | Error::AlreadyClosed = e {
+                if let Err(e) = socket.send(ws_frame).await {
+                    if e.is_closed() {
                         // Do nothing, stream will close shortly
                     } else {
                         error_tx.try_send(e).ok();
@@ -344,23 +388,6 @@ where
             }
         }
     }
-}
-
-/// Handle the websocket close sequence.
-async fn close_websocket<Si, St>(timeout: Duration, mut ws_tx: Si, mut ws_rx: St)
-where
-    Si: Sink<tungstenite::Message, Error = Error> + Unpin,
-    St: Stream<Item = Result<tungstenite::Message, Error>> + Unpin,
-{
-    // TODO: determine the proper close frame we need to send from
-    // seen errors, if any.
-    let close_websocket = ws_tx.send(tungstenite::Message::Close(None));
-
-    let drain_receiver = async { while ws_rx.next().await.is_some() {} };
-
-    let close_and_drain = async { join!(close_websocket, drain_receiver) };
-
-    time::timeout(timeout, close_and_drain).await.ok();
 }
 
 async fn close_and_drain_receiver<T>(mut rx: Receiver<T>) {
